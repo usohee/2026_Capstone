@@ -1,4 +1,4 @@
-# 🛡️ Skin Analysis Engine v1.0
+# 🛡️ Skin Analysis Test Engine v1.0
 OpenCV 기반의 안면 피부 부위별 분석 및 수치 테스트 엔진
 
 ## 📊 Performance Validation
