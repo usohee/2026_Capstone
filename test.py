@@ -212,7 +212,7 @@ def visualize(my_scores, ref, errors, save_path="result.png"):
     ax1 = axes[0]
     keys   = list(my_scores.keys())
     values = list(my_scores.values())
-    bars = ax1.bar(keys, values, color=["#9B59B6", "#EF9F27", "#378ADD", "#E24B4A"])
+    bars = ax1.bar(keys, values, color=["#faf1f2", "#f1d1d2", "#c1a3a3", "#7d5959"])
     ax1.set_ylim(0, 100)
     ax1.set_title("내 알고리즘 점수 (낮을수록 좋음)")
     ax1.set_ylabel("점수")
@@ -225,7 +225,7 @@ def visualize(my_scores, ref, errors, save_path="result.png"):
     if errors:
         err_keys = list(errors.keys())
         err_vals = list(errors.values())
-        bar_colors = ["#2ECC71" if v <= 30 else "#E74C3C" for v in err_vals]
+        bar_colors = ["#86dadb" if v <= 30 else "#E74C3C" for v in err_vals]
         bars2 = ax2.bar(err_keys, err_vals, color=bar_colors)
         ax2.axhline(y=30, color='gray', linestyle='--', linewidth=1, label='허용 기준 30%')
         ax2.set_ylim(0, max(max(err_vals) * 1.3, 50))
