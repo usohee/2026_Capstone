@@ -9,14 +9,14 @@ labeling_0001/
 
 # 2. 하지만 특정 경로의 sample.jpg 하나만 "예외"로 허용합니다. (느낌표 필수!)
 !jpg_0001/sample.jpg
-!labeling_0001\0001_sample_00.json
-!labeling_0001\0001_sample_01.json
-!labeling_0001\0001_sample_02.json
-!labeling_0001\0001_sample_03.json
-!labeling_0001\0001_sample_04.json
-!labeling_0001\0001_sample_05.json
-!labeling_0001\0001_sample_06.json
-!labeling_0001\0001_sample_07.json
+!labeling_0001/0001_sample_00.json
+!labeling_0001/0001_sample_01.json
+!labeling_0001/0001_sample_02.json
+!labeling_0001/0001_sample_03.json
+!labeling_0001/0001_sample_04.json
+!labeling_0001/0001_sample_05.json
+!labeling_0001/0001_sample_06.json
+!labeling_0001/0001_sample_07.json
 
 # 3. 결과 이미지도 올리고 싶다면 이것도 예외 처리하세요.
 !result.png
