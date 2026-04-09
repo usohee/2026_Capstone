@@ -1,13 +1,11 @@
-# 파이썬 캐시 및 결과물
+# 1. 일단 캐시 등 기본 제외
 __pycache__/
 
-# 1. 일단 모든 폴더와 모든 jpg, json 파일을 막습니다.
-jpg_0001/
-labeling_0001/
-*.jpg
-*.json
+# 2. 폴더 자체를 막지 말고, 폴더 '안'의 파일들을 막습니다. (끝에 /* 추가)
+jpg_0001/*
+labeling_0001/*
 
-# 2. 하지만 특정 경로의 sample.jpg 하나만 "예외"로 허용합니다. (느낌표 필수!)
+# 3. 이제 '특정 파일'만 예외로 허용합니다. (이제 잘 작동할 거예요!)
 !jpg_0001/sample.jpg
 !labeling_0001/0001_sample_00.json
 !labeling_0001/0001_sample_01.json
@@ -18,5 +16,5 @@ labeling_0001/
 !labeling_0001/0001_sample_06.json
 !labeling_0001/0001_sample_07.json
 
-# 3. 결과 이미지도 올리고 싶다면 이것도 예외 처리하세요.
+# 4. 결과 이미지 예외
 !result.png
