@@ -32,13 +32,6 @@ def extract_roi_center(img_bgr, img_gray):
     h, w = img_gray.shape
     return img_bgr[h//4:h*3//4, w//4:w*3//4], img_gray[h//4:h*3//4, w//4:w*3//4]
 
-# ── 홍조 / 색소침착 ───────────────────────────────
-def detect_redness(roi_bgr):
-    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
-    mask1 = cv2.inRange(hsv, (0,   50, 50), (10,  255, 255))
-    mask2 = cv2.inRange(hsv, (170, 50, 50), (180, 255, 255))
-    return float(np.count_nonzero(cv2.bitwise_or(mask1, mask2))) / mask1.size
-
 def detect_pigmentation(roi_gray):
     binary = cv2.adaptiveThreshold(
         roi_gray, 255,
@@ -71,7 +64,6 @@ MAX_VALUES = {
     "pigmentation": 200,    # AI Hub 장비 측정치 기준 캘리브레이션 (오차 27.9%)
     "pore":         20.0,   # l/r_cheek_pore 점수 비교 기준 (오차 11.5%)
     "sebum":        0.6,    # moisture 역수 기준 (오차 2.1%)
-    "redness":      0.3,   # 추후 검증 필요
 }
 
 def normalize(key, value):
@@ -212,7 +204,7 @@ def visualize(my_scores, ref, errors, save_path="result.png"):
     ax1 = axes[0]
     keys   = list(my_scores.keys())
     values = list(my_scores.values())
-    bars = ax1.bar(keys, values, color=["#faf1f2", "#f1d1d2", "#c1a3a3", "#7d5959"])
+    bars = ax1.bar(keys, values, color=["#faf1f2", "#f1d1d2", "#c1a3a3"]) # "#7d5959"
     ax1.set_ylim(0, 100)
     ax1.set_title("내 알고리즘 점수 (낮을수록 좋음)")
     ax1.set_ylabel("점수")
@@ -225,7 +217,7 @@ def visualize(my_scores, ref, errors, save_path="result.png"):
     if errors:
         err_keys = list(errors.keys())
         err_vals = list(errors.values())
-        bar_colors = ["#86dadb" if v <= 30 else "#E74C3C" for v in err_vals]
+        bar_colors = ["#86dadb" if v <= 30 else "#007095" for v in err_vals]
         bars2 = ax2.bar(err_keys, err_vals, color=bar_colors)
         ax2.axhline(y=30, color='gray', linestyle='--', linewidth=1, label='허용 기준 30%')
         ax2.set_ylim(0, max(max(err_vals) * 1.3, 50))
@@ -269,7 +261,6 @@ def analyze(image_path, json_paths=None):
         "pigmentation": detect_pigmentation(roi_gray),
         "pore":         detect_pore(roi_gray),
         "sebum":        detect_sebum(roi_gray),
-        "redness":      detect_redness(roi_bgr),
     }
 
     scores = {k: normalize(k, v) for k, v in raw.items()}
