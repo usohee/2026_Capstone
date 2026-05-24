@@ -6,8 +6,8 @@ import os
 import glob
 from flask import Flask, request, jsonify
 from matplotlib import rc
-
-rc('font', family='Malgun Gothic')
+import matplotlib.font_manager as fm
+plt.rcParams['font.family'] = 'Malgun Gothic'
 plt.rcParams['axes.unicode_minus'] = False
 
 app = Flask(__name__)
@@ -97,8 +97,8 @@ def detect_sebum(roi_gray):
 
 # ── 4. 정규화 ────────────────────────────────────────────
 MAX_VALUES = {
-    "acne":         30,
-    "pigmentation": 200,
+    "acne":         50,
+    "pigmentation": 250,
     "pore":         27.0,
     "sebum":        0.6,
 }
