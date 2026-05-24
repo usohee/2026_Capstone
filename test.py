@@ -329,7 +329,7 @@ def analyze_acne_pipeline(image_path, mask_path):
         # 개수 비교
         axes[2].bar(["ACNE04 (정답)", "내 알고리즘"],
                     [real, my_count],
-                    color=["#2ECC71", "#E74C3C" if rate > 30 else "#3498DB"])
+                    color=["#b9e49a", "#E74C3C" if rate > 30 else "#76a3cb"])
         axes[2].set_title(f"acne 개수 비교 (오차율: {rate}%)")
         axes[2].set_ylabel("개수")
         for i, v in enumerate([real, my_count]):
