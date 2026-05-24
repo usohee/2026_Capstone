@@ -3,14 +3,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 import json
 import os
-import matplotlib.pyplot as plt
+import glob
+from flask import Flask, request, jsonify
 from matplotlib import rc
 
-# 맑은 고딕 설정 (윈도우 기준)
 rc('font', family='Malgun Gothic')
 plt.rcParams['axes.unicode_minus'] = False
 
-# ── 전처리 ──────────────────────────────────────
+app = Flask(__name__)
+
+# OpenCV 내장 얼굴 인식 (mediapipe 대체)
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+)
+
+# ── 1. 전처리 ────────────────────────────────────────────
 def preprocess(img_bgr):
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
@@ -21,280 +28,409 @@ def preprocess(img_bgr):
     img_gray = cv2.GaussianBlur(img_gray, (5, 5), 0)
     return img_bgr, img_gray
 
-# ── ROI: bbox 좌표 직접 사용 ──────────────────────
+# ── 2. ROI 추출 ──────────────────────────────────────────
+def extract_roi_mediapipe(img_bgr):
+    """OpenCV Haar Cascade 기반 얼굴 크롭"""
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+    if len(faces) == 0:
+        h, w = img_bgr.shape[:2]
+        return img_bgr[h//4:h*3//4, w//4:w*3//4]
+    x, y, w, h = faces[0]
+    x1 = max(0, x - 20)
+    y1 = max(0, y - 20)
+    x2 = min(img_bgr.shape[1], x + w + 20)
+    y2 = min(img_bgr.shape[0], y + h + 20)
+    return img_bgr[y1:y2, x1:x2]
+
 def extract_roi_by_bbox(img, bbox):
-    """JSON의 bbox [x, y, w, h] 로 정확하게 자르기"""
     x, y, w, h = bbox
     return img[y:y+h, x:x+w]
 
-def extract_roi_center(img_bgr, img_gray):
-    """bbox 없을 때 임시 중앙 크롭"""
-    h, w = img_gray.shape
-    return img_bgr[h//4:h*3//4, w//4:w*3//4], img_gray[h//4:h*3//4, w//4:w*3//4]
+# ── 3. 탐지 알고리즘 ─────────────────────────────────────
+def get_skin_type(roi_gray):
+    """
+    평균 밝기로 피부 타입 자동 판별
+    밝음(지성/보통) vs 어두움(건성/색소침착)
+    """
+    mean_brightness = np.mean(roi_gray)
+    if mean_brightness >= 130:
+        return "oily"    # 지성 (밝은 피부)
+    else:
+        return "dry"     # 건성 (어두운 피부)
 
+def detect_acne(roi_bgr):
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    mask1 = cv2.inRange(hsv, np.array([0,  80, 80]),  np.array([10, 255, 255]))
+    mask2 = cv2.inRange(hsv, np.array([165, 80, 80]), np.array([180, 255, 255]))
+    red_mask = cv2.bitwise_or(mask1, mask2)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))  # 3→7 (노이즈 제거 강화)
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
+    contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return len([c for c in contours if 500 < cv2.contourArea(c) < 3000])
+    #                                   ↑ 10→200         800→3000
 def detect_pigmentation(roi_gray):
+    skin_type = get_skin_type(roi_gray)
+    if skin_type == "oily":
+        min_area = 80    # 지성 → 작은 반점도 감지
+    else:
+        min_area = 100   # 건성/중년 → 주름 노이즈 제거
     binary = cv2.adaptiveThreshold(
-        roi_gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        blockSize=51,   # 21 → 51  (더 넓은 영역 기준으로 판단, 노이즈 감소)
-        C=20            # 10 → 20  (더 엄격하게, 진한 반점만 잡음)
+        roi_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, blockSize=51, C=20
     )
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    spots = [c for c in contours if 80 < cv2.contourArea(c) < 1500]
-    #                                 ↑ 30→80  (작은 노이즈 제거)
-    return len(spots)
-
-# ── 모공 ─────────────────────────────────────────
+    return len([c for c in contours if min_area < cv2.contourArea(c) < 1500])
 def detect_pore(roi_gray):
-    """Laplacian variance → l/r_cheek_pore 평균과 비교"""
     return float(cv2.Laplacian(roi_gray, cv2.CV_64F).var())
 
-# ── 피지 (수분의 역수로 추정) ─────────────────────
 def detect_sebum(roi_gray):
-    """밝기 반사 → moisture 역수와 비교"""
-    _, thresh = cv2.threshold(roi_gray, 200, 255, cv2.THRESH_BINARY)
+    skin_type = get_skin_type(roi_gray)
+    if skin_type == "oily":
+        threshold = 200   # 지성 → 높은 임계값 (반사 많음)
+    else:
+        threshold = 150   # 건성 → 낮은 임계값 (반사 적음)
+    _, thresh = cv2.threshold(roi_gray, threshold, 255, cv2.THRESH_BINARY)
     return float(np.count_nonzero(thresh)) / thresh.size
 
-# ── 정규화 ────────────────────────────────────────
+# ── 4. 정규화 ────────────────────────────────────────────
 MAX_VALUES = {
-    "pigmentation": 200,    # AI Hub 장비 측정치 기준 캘리브레이션 (오차 27.9%)
-    "pore":         20.0,   # l/r_cheek_pore 점수 비교 기준 (오차 11.5%)
-    "sebum":        0.6,    # moisture 역수 기준 (오차 2.1%)
+    "acne":         30,
+    "pigmentation": 200,
+    "pore":         27.0,
+    "sebum":        0.6,
 }
 
 def normalize(key, value):
     return min(100, int(value / MAX_VALUES[key] * 100))
 
-# ── JSON 8개 파싱 → 비교 기준값 추출 ─────────────
+# ── 5. 라벨 파싱 ─────────────────────────────────────────
 def parse_label_files(json_paths):
-    """
-    facepart별로 JSON을 분류해서
-    비교에 필요한 장비 측정치만 추출
-    """
-    ref = {
-        "pigmentation_count": None,  # facepart 0
-        "pore_avg":           None,  # facepart 5,6 평균
-        "moisture_avg":       None,  # facepart 1,5,6 평균
-        "bbox_by_part":       {},    # facepart → bbox
-    }
-    moisture_vals = []
-    pore_vals     = []
+    ref = {"pigmentation_count": None, "pore_avg": None,
+           "moisture_avg": None, "bbox_by_part": {}}
+    moisture_vals, pore_vals = [], []
 
     for path in json_paths:
+        if not os.path.exists(path): continue
         with open(path, 'r', encoding='utf-8') as f:
             d = json.load(f)
-
         part = d["images"]["facepart"]
-        bbox = d["images"]["bbox"]
-        ref["bbox_by_part"][part] = bbox
-        eq   = d.get("equipment") or {}
-
+        ref["bbox_by_part"][part] = d["images"]["bbox"]
+        eq = d.get("equipment") or {}
         if part == 0:
             ref["pigmentation_count"] = eq.get("pigmentation_count")
-
         if part == 1 and "forehead_moisture" in eq:
             moisture_vals.append(eq["forehead_moisture"])
-
         if part == 5:
-            if "l_cheek_pore" in eq:
-                pore_vals.append(eq["l_cheek_pore"])
-            if "l_cheek_moisture" in eq:
-                moisture_vals.append(eq["l_cheek_moisture"])
-
+            if "l_cheek_pore"     in eq: pore_vals.append(eq["l_cheek_pore"])
+            if "l_cheek_moisture" in eq: moisture_vals.append(eq["l_cheek_moisture"])
         if part == 6:
-            if "r_cheek_pore" in eq:
-                pore_vals.append(eq["r_cheek_pore"])
-            if "r_cheek_moisture" in eq:
-                moisture_vals.append(eq["r_cheek_moisture"])
+            if "r_cheek_pore"     in eq: pore_vals.append(eq["r_cheek_pore"])
+            if "r_cheek_moisture" in eq: moisture_vals.append(eq["r_cheek_moisture"])
 
-    if pore_vals:
-        ref["pore_avg"] = round(sum(pore_vals) / len(pore_vals), 1)
-    if moisture_vals:
-        ref["moisture_avg"] = round(sum(moisture_vals) / len(moisture_vals), 1)
-
+    if pore_vals:     ref["pore_avg"]     = round(sum(pore_vals)     / len(pore_vals),     1)
+    if moisture_vals: ref["moisture_avg"] = round(sum(moisture_vals) / len(moisture_vals), 1)
     return ref
 
-# ── 편차 계산 + 튜닝 힌트 ────────────────────────
+# ── 6. 오차 계산 ─────────────────────────────────────────
 def calc_error(label, algo, label_max, key):
-    """오차율 계산 및 MAX_VALUES 조정 힌트 출력"""
-    if label is None or algo is None:
-        return None
+    if label is None or algo is None: return None
     error = abs(algo - label)
     rate  = round(error / max(label, 1) * 100, 1)
     ratio = algo / max(label, 1)
-
-    hint = ""
     if ratio > 1.3:
         hint = f"  ▲ 과검출 → MAX_VALUES['{key}'] 를 {round(MAX_VALUES[key]*ratio,1)} 으로 올려봐"
     elif ratio < 0.7:
         hint = f"  ▼ 미검출 → MAX_VALUES['{key}'] 를 {round(MAX_VALUES[key]*ratio,1)} 으로 내려봐"
     else:
         hint = f"  ✓ 오차 {rate}% — 허용 범위 (30% 이내)"
-
     return {"error": error, "rate": rate, "hint": hint}
 
-# ── 비교 출력 ─────────────────────────────────────
+# ── 7. 비교 출력 ─────────────────────────────────────────
 def compare(ref, my_raw, my_scores):
-    """
-    장비 측정치 vs 내 알고리즘 raw 값 비교.
-    pore는 단위가 달라서 정규화 점수로 비교.
-    """
-    # moisture → sebum 역수 변환 (수분 100% = 피지 0)
     moisture_as_sebum = round(100 - ref["moisture_avg"], 1) if ref["moisture_avg"] else None
-
-    rows = [
-        # (항목명,       장비값,                        내 raw값,                단위)
-        ("pigmentation", ref["pigmentation_count"],     my_raw["pigmentation"],  "개"),
-        ("pore(점수)",   None,                          None,                    ""),   # 단위 달라 점수 비교
-        ("sebum(수분역)", moisture_as_sebum,            round(my_raw["sebum"]*100,1), "%"),
-    ]
-
     print("\n" + "="*52)
-    print("      알고리즘 vs 전문 장비 비교 리포트")
+    print("      [오차율 백테스팅] 알고리즘 vs 전문 장비 실측 비교")
     print("="*52)
     print(f"  {'항목':<16} {'장비 측정치':>12}  {'내 알고리즘':>12}  {'오차율':>6}")
     print("-"*52)
-
     errors = {}
 
-    # pigmentation
-    pig_err = calc_error(ref["pigmentation_count"], my_raw["pigmentation"],
-                         MAX_VALUES["pigmentation"], "pigmentation")
+    pig_err = calc_error(ref["pigmentation_count"], my_raw["pigmentation"], MAX_VALUES["pigmentation"], "pigmentation")
     if pig_err:
-        print(f"  {'pigmentation':<16} {ref['pigmentation_count']:>12}개  "
-              f"{int(my_raw['pigmentation']):>11}개  {pig_err['rate']:>5}%")
+        print(f"  {'pigmentation':<16} {ref['pigmentation_count']:>12}개  {int(my_raw['pigmentation']):>11}개  {pig_err['rate']:>5}%")
         print(pig_err["hint"])
         errors["pigmentation"] = pig_err["rate"]
 
-    # pore — 단위 달라서 점수로 비교
-    pore_score_label = None
-    if ref["pore_avg"]:
-        # 장비 pore는 픽셀 면적(629), 우리는 variance → 점수로만 비교
-        pore_score_label = min(100, int(ref["pore_avg"] / 1000 * 100))
-    pore_score_algo = my_scores["pore"]
-    pore_err = calc_error(pore_score_label, pore_score_algo, 100, "pore")
+    pore_score_label = min(100, int(ref["pore_avg"] / 1000 * 100)) if ref["pore_avg"] else None
+    pore_err = calc_error(pore_score_label, my_scores["pore"], 100, "pore")
     if pore_err:
-        print(f"  {'pore(점수)':<16} {pore_score_label:>11}점  "
-              f"{pore_score_algo:>11}점  {pore_err['rate']:>5}%")
+        print(f"  {'pore(점수)':<16} {pore_score_label:>11}점  {my_scores['pore']:>11}점  {pore_err['rate']:>5}%")
         print(pore_err["hint"])
         errors["pore"] = pore_err["rate"]
 
-    # sebum (수분 역수)
     if moisture_as_sebum is not None:
         sebum_algo = round(my_raw["sebum"] * 100, 1)
         sebum_err  = calc_error(moisture_as_sebum, sebum_algo, 100, "sebum")
         if sebum_err:
-            print(f"  {'sebum(수분역)':<16} {moisture_as_sebum:>11}%  "
-                  f"{sebum_algo:>11}%  {sebum_err['rate']:>5}%")
+            print(f"  {'sebum(수분역)':<16} {moisture_as_sebum:>11}%  {sebum_algo:>11}%  {sebum_err['rate']:>5}%")
             print(sebum_err["hint"])
             errors["sebum"] = sebum_err["rate"]
 
     print("="*52)
     return errors
 
-# ── 시각화 ───────────────────────────────────────
+# ── 8. 시각화 ────────────────────────────────────────────
 def visualize(my_scores, ref, errors, save_path="result.png"):
     fig, axes = plt.subplots(1, 2, figsize=(13, 4))
-
-    # 왼쪽: 내 알고리즘 점수
     ax1 = axes[0]
-    keys   = list(my_scores.keys())
-    values = list(my_scores.values())
-    bars = ax1.bar(keys, values, color=["#faf1f2", "#f1d1d2", "#c1a3a3"]) # "#7d5959"
+    keys, values = list(my_scores.keys()), list(my_scores.values())
+    bars = ax1.bar(keys, values, color=["#faf1f2", "#f1d1d2", "#c1a3a3", "#7d5959"])
     ax1.set_ylim(0, 100)
-    ax1.set_title("내 알고리즘 점수 (낮을수록 좋음)")
-    ax1.set_ylabel("점수")
+    ax1.set_title("내 알고리즘 지표별 감점 점수 (낮을수록 우수)")
+    ax1.set_ylabel("점수 (Scale 0-100)")
     for bar, v in zip(bars, values):
-        ax1.text(bar.get_x() + bar.get_width()/2, v + 1.5,
-                 str(v), ha='center', fontsize=10)
+        ax1.text(bar.get_x() + bar.get_width()/2, v + 1.5, str(v), ha='center', fontsize=10)
 
-    # 오른쪽: 장비 vs 알고리즘 오차율
     ax2 = axes[1]
     if errors:
-        err_keys = list(errors.keys())
-        err_vals = list(errors.values())
+        err_keys, err_vals = list(errors.keys()), list(errors.values())
         bar_colors = ["#86dadb" if v <= 30 else "#007095" for v in err_vals]
         bars2 = ax2.bar(err_keys, err_vals, color=bar_colors)
-        ax2.axhline(y=30, color='gray', linestyle='--', linewidth=1, label='허용 기준 30%')
+        ax2.axhline(y=30, color='red', linestyle='--', linewidth=1, label='캡스톤 수용 목표치 (30%)')
         ax2.set_ylim(0, max(max(err_vals) * 1.3, 50))
-        ax2.set_title("장비 측정치 대비 오차율 (%)")
+        ax2.set_title("의료 진단 장비 실측치 대비 편차 오차율 (%)")
         ax2.set_ylabel("오차율 (%)")
         ax2.legend()
         for bar, v in zip(bars2, err_vals):
-            ax2.text(bar.get_x() + bar.get_width()/2, v + 0.5,
-                     f"{v}%", ha='center', fontsize=10)
+            ax2.text(bar.get_x() + bar.get_width()/2, v + 0.5, f"{v}%", ha='center', fontsize=10)
     else:
-        ax2.text(0.5, 0.5, "비교 데이터 없음", ha='center', va='center',
-                 transform=ax2.transAxes, fontsize=13, color='gray')
+        ax2.text(0.5, 0.5, "비교용 라벨 JSON 없음", ha='center', va='center',
+                 transform=ax2.transAxes, color='gray')
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
-    plt.show()
-    print(f"  결과 저장: {save_path}")
+    plt.close()
+    print(f"  [시각화 완성] 결과 저장: {save_path}")
 
-# ── 메인 ─────────────────────────────────────────
-def analyze(image_path, json_paths=None):
+# ── 9. 메인 파이프라인 ───────────────────────────────────
+def analyze_pipeline(image_path, json_paths=None):
     img_bgr = cv2.imread(image_path)
     if img_bgr is None:
-        raise FileNotFoundError(f"이미지를 못 읽었어: {image_path}")
+        raise FileNotFoundError(f"이미지 없음: {image_path}")
 
-    img_bgr, img_gray = preprocess(img_bgr)
-
-    # JSON bbox가 있으면 정확한 ROI, 없으면 중앙 크롭
     ref = None
     if json_paths:
         ref = parse_label_files(json_paths)
-        bbox_full = ref["bbox_by_part"].get(0)  # facepart 0 = 전체 얼굴
+        bbox_full = ref["bbox_by_part"].get(0)
         if bbox_full:
-            roi_bgr  = extract_roi_by_bbox(img_bgr,  bbox_full)
-            roi_gray = extract_roi_by_bbox(img_gray, bbox_full)
+            roi_bgr_processed, roi_gray_calib = preprocess(
+                extract_roi_by_bbox(img_bgr, bbox_full)
+            )
         else:
-            roi_bgr, roi_gray = extract_roi_center(img_bgr, img_gray)
+            roi_bgr_processed, roi_gray_calib = preprocess(
+                extract_roi_mediapipe(img_bgr)
+            )
     else:
-        roi_bgr, roi_gray = extract_roi_center(img_bgr, img_gray)
+        roi_bgr_processed, roi_gray_calib = preprocess(
+            extract_roi_mediapipe(img_bgr)
+        )
 
     raw = {
+        "acne":         detect_acne(roi_bgr_processed),
+        "pigmentation": detect_pigmentation(roi_gray_calib),
+        "pore":         detect_pore(roi_gray_calib),
+        "sebum":        detect_sebum(roi_gray_calib),
+    }
+    print(f"  [피부 타입 판별] {get_skin_type(roi_gray_calib)} (평균 밝기: {np.mean(roi_gray_calib):.1f})")
+    scores = {k: normalize(k, v) for k, v in raw.items()}
+    total_score = max(0, 100 - round(sum(scores.values()) / len(scores)))
+
+    print("\n" + "═"*30 + "\n  [로컬 수동 테스트 검증 결과]\n" + "═"*30)
+    for k, v in scores.items():
+        if k in ["acne", "pigmentation"]:
+            print(f"  {k:>14}: {v:>3}점  (Raw 수치: {int(raw[k])}개)")
+        else:
+            print(f"  {k:>14}: {v:>3}점  (Raw 수치: {raw[k]:.4f})")
+    print(f"  {'종합 피부 점수':>12}: {total_score}점")
+
+    errors = compare(ref, raw, scores) if ref else {}
+    visualize(scores, ref or {}, errors)
+    return scores, total_score, errors
+
+# ── acne 전용 파이프라인 ─────────────────────────────────
+def parse_acne_mask(mask_path):
+    """
+    ACNE04 gt_mask PNG → 여드름 개수 + contour 추출
+    흰색 픽셀(255) = 여드름 영역
+    """
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        return None
+
+    _, binary = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # 노이즈 제거: 너무 작은 건 제외
+    spots = [c for c in contours if cv2.contourArea(c) > 10]
+
+    return {
+        "total":    len(spots),
+        "contours": spots,
+        "mask":     binary
+    }
+
+
+def analyze_acne_pipeline(image_path, mask_path):
+    img_bgr = cv2.imread(image_path)
+    if img_bgr is None:
+        print(f"이미지 없음: {image_path}")
+        return
+
+    # clean_roi는 이미 배경 제거됨 → ROI 크롭 생략
+    roi_bgr_processed, _ = preprocess(img_bgr)   # ← extract_roi_mediapipe 제거
+    my_count = detect_acne(roi_bgr_processed)
+    # ... 이하 동일
+
+    label = parse_acne_mask(mask_path)
+
+    print(f"\n  내 알고리즘 acne 개수: {my_count}개")
+
+    if label:
+        real  = label["total"]
+        error = abs(my_count - real)
+        rate  = round(error / max(real, 1) * 100, 1)
+
+        print(f"  ACNE04 마스크 개수:    {real}개")
+        print(f"  오차율:                {rate}%")
+
+        if rate <= 30:
+            print("  ✓ 허용 범위 이내")
+        elif my_count > real:
+            print("  ▲ 과검출 → 면적 하한 올려봐 (50 → 80)")
+        else:
+            print("  ▼ 미검출 → 면적 하한 내려봐 (50 → 20)")
+
+        # 시각화: 마스크 오버레이 + 개수 비교
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+        # 원본 이미지
+        axes[0].imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+        axes[0].set_title("원본 이미지")
+        axes[0].axis('off')
+
+        # ACNE04 마스크
+        axes[1].imshow(label["mask"], cmap='Reds')
+        axes[1].set_title(f"ACNE04 정답 마스크 ({real}개)")
+        axes[1].axis('off')
+
+        # 개수 비교
+        axes[2].bar(["ACNE04 (정답)", "내 알고리즘"],
+                    [real, my_count],
+                    color=["#2ECC71", "#E74C3C" if rate > 30 else "#3498DB"])
+        axes[2].set_title(f"acne 개수 비교 (오차율: {rate}%)")
+        axes[2].set_ylabel("개수")
+        for i, v in enumerate([real, my_count]):
+            axes[2].text(i, v + 0.1, str(v), ha='center', fontsize=12)
+
+        plt.tight_layout()
+        plt.savefig("acne_result.png", dpi=150)
+        plt.show()
+        print("  acne 결과 저장: acne_result.png")
+        return rate
+    return None
+
+# ── 10. Flask API ────────────────────────────────────────
+@app.route('/analyze-skin', methods=['POST'])
+def analyze_skin_api():
+    if 'image' not in request.files:
+        return jsonify({"success": False, "message": "이미지 없음"}), 400
+    file = request.files['image']
+    file_bytes = np.frombuffer(file.read(), np.uint8)
+    img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        return jsonify({"success": False, "message": "이미지 디코딩 실패"}), 400
+
+    roi_bgr_processed, roi_gray = preprocess(extract_roi_mediapipe(img_bgr))
+    raw = {
+        "acne":         detect_acne(roi_bgr_processed),
         "pigmentation": detect_pigmentation(roi_gray),
         "pore":         detect_pore(roi_gray),
         "sebum":        detect_sebum(roi_gray),
     }
-
     scores = {k: normalize(k, v) for k, v in raw.items()}
-    total  = 100 - round(sum(scores.values()) / len(scores))
+    total_score = max(0, 100 - round(sum(scores.values()) / len(scores)))
 
-    print("=== 피부 분석 결과 ===")
-    for k, v in scores.items():
-        unit = "개" if k == "pigmentation" else f"{raw[k]:.4f}"
-        print(f"  {k:>14}: {v:>3}점  (raw: {unit})")
-    print(f"  {'종합':>14}: {total}점")
+    return jsonify({
+        "success": True,
+        "total_score": total_score,
+        "scores": scores,
+        "raw_values": {
+            "acne_count":         raw["acne"],
+            "pigmentation_count": raw["pigmentation"],
+            "pore_variance":      round(raw["pore"], 4),
+            "sebum_ratio":        round(raw["sebum"] * 100, 1)
+        }
+    }), 200
 
-    errors = {}
-    if ref:
-        errors = compare(ref, raw, scores)
-
-    visualize(scores, ref or {}, errors)
-    return scores, total
-
-# ── 실행 ─────────────────────────────────────────
+# ── 11. 엔트리포인트 ─────────────────────────────────────
 if __name__ == "__main__":
-    IMAGE_PATH = "jpg_0001/sample.jpg"
 
-    # 같은 폴더의 JSON 8개를 리스트로 넘기면 돼
-    JSON_PATHS = [
-        "labeling_0001/0001_sample_00.json",
-        "labeling_0001/0001_sample_01.json",
-        "labeling_0001/0001_sample_02.json",
-        "labeling_0001/0001_sample_03.json",
-        "labeling_0001/0001_sample_04.json",
-        "labeling_0001/0001_sample_05.json",
-        "labeling_0001/0001_sample_06.json",
-        "labeling_0001/0001_sample_07.json",
-        "labeling_0001/0001_sample_08.json",
+    # ── pigmentation / pore / sebum: 다중 샘플 검증 ──────
+    skin_samples = [
+        (r"pps\jpg_0001\sample.jpg", "pps\labeling_0001"),
+        (r"pps\jpg_0081\0081.jpg",   "pps\labeling_0081"),
     ]
-    # 없는 파일은 자동으로 건너뜀
-    existing = [p for p in JSON_PATHS if os.path.exists(p)]
-    analyze(IMAGE_PATH, existing)
+
+    all_errors = {"pigmentation": [], "pore": [], "sebum": []}
+
+    for img_path, label_dir in skin_samples:
+        if not os.path.exists(img_path):
+            print(f"  ⚠ 건너뜀: {img_path}")
+            continue
+        json_paths = sorted(glob.glob(os.path.join(label_dir, "*.json")))
+        print(f"\n{'★'*40}")
+        print(f"  [피부 검증] {img_path}")
+        print(f"{'★'*40}")
+        scores, total, errors = analyze_pipeline(img_path, json_paths)
+        for key, val in errors.items():
+            if key in all_errors:
+                all_errors[key].append(val)
+
+    # 평균 오차율 출력
+    print("\n" + "="*52)
+    print("  [전체 샘플 평균 오차율]")
+    print("="*52)
+    for key, vals in all_errors.items():
+        if vals:
+            avg = round(sum(vals) / len(vals), 1)
+            status = "✅" if avg <= 30 else "❌"
+            print(f"  {key:>14}: 평균 {avg}%  {status}")
+
+    # ── acne: 다중 샘플 검증 ─────────────────────────────
+    acne_samples = [
+        (r"acne\img_data\levle2_81.jpg",  r"acne\gt_mask\levle2_81.png"),
+        (r"acne\img_data\levle3_94.jpg",  r"acne\gt_mask\levle3_94.png"),
+    ]
+
+    acne_errors = []
+
+    for img_path, mask_path in acne_samples:
+        if not os.path.exists(img_path):
+            print(f"  ⚠ 건너뜀: {img_path}")
+            continue
+        print(f"\n{'★'*40}")
+        print(f"  [acne 검증] {img_path}")
+        print(f"{'★'*40}")
+        result = analyze_acne_pipeline(img_path, mask_path)
+        if result is not None:
+            acne_errors.append(result)
+
+    if acne_errors:
+        avg_acne = round(sum(acne_errors) / len(acne_errors), 1)
+        status = "✅" if avg_acne <= 30 else "❌"
+        print(f"\n  {'acne':>14}: 평균 {avg_acne}%  {status}")
+
+    # app.run(host='0.0.0.0', port=5000, debug=True)
